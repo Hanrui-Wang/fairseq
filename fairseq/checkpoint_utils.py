@@ -91,22 +91,21 @@ def save_checkpoint(args, trainer, epoch_itr, val_loss):
                 os.remove(old_chk)
 
 
-def load_checkpoint(args, trainer, **passthrough_args):
-    """
-    Load a checkpoint and restore the training iterator.
+def get_checkpoint_path(args):
+    if os.path.isabs(args.restore_file):
+        checkpoint_path = args.restore_file
+    else:
+        checkpoint_path = os.path.join(args.save_dir, args.restore_file)
+    return checkpoint_path
 
-    *passthrough_args* will be passed through to
-    ``trainer.get_train_iterator``.
-    """
+
+def load_checkpoint(args, trainer):
+    """Load a checkpoint and restore the training iterator."""
     # only one worker should attempt to create the required dir
     if args.distributed_rank == 0:
         os.makedirs(args.save_dir, exist_ok=True)
 
-    if args.restore_file == "checkpoint_last.pt":
-        checkpoint_path = os.path.join(args.save_dir, "checkpoint_last.pt")
-    else:
-        checkpoint_path = args.restore_file
-
+    checkpoint_path = get_checkpoint_path(args)
     extra_state = trainer.load_checkpoint(
         checkpoint_path,
         args.reset_optimizer,
@@ -138,6 +137,19 @@ def load_checkpoint(args, trainer, **passthrough_args):
     trainer.lr_step(epoch_itr.epoch)
 
     return extra_state, epoch_itr
+
+
+def load_checkpoint_tpu(args, trainers, device_preloaded):
+    for device, trainer in trainers.items():
+        if device != device_preloaded:
+            _ = trainer.load_checkpoint(
+                get_checkpoint_path(args),
+                reset_optimizer=args.reset_optimizer,
+                reset_lr_scheduler=args.reset_lr_scheduler,
+                optimizer_overrides=eval(args.optimizer_overrides),
+                reset_meters=args.reset_meters,
+            )
+        trainer.meters_to_device(device)
 
 
 def load_checkpoint_to_cpu(path, arg_overrides=None):

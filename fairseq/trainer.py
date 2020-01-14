@@ -32,7 +32,7 @@ class Trainer(object):
     communication of the gradients across workers.
     """
 
-    def __init__(self, args, task, model, criterion, dummy_batch=None, oom_batch=None):
+    def __init__(self, args, task, model, criterion, dummy_batch=None, oom_batch=None, xla=False):
         self.args = args
         self.task = task
 
@@ -58,27 +58,26 @@ class Trainer(object):
         self._wrapped_criterion = None
         self._wrapped_model = None
 
-        if self.cuda and args.distributed_world_size > 1:
-            self._grad_norm_buf = torch.cuda.DoubleTensor(args.distributed_world_size)
-        else:
-            self._grad_norm_buf = None
+        self.init_meters(args)
+        self.xla = xla
 
-        metrics.log_start_time("wall", priority=790, round=0)
-
-    @property
-    def criterion(self):
-        if self._wrapped_criterion is None:
-            if (
-                utils.has_parameters(self._criterion)
-                and self.args.distributed_world_size > 1
-                and not self.args.use_bmuf
-            ):
-                self._wrapped_criterion = models.DistributedFairseqModel(
-                    self.args, self._criterion
-                )
-            else:
-                self._wrapped_criterion = self._criterion
-        return self._wrapped_criterion
+    def init_meters(self, args):
+        self.meters = OrderedDict()
+        self.meters['train_loss'] = AverageMeter()
+        self.meters['train_nll_loss'] = AverageMeter()
+        self.meters['valid_loss'] = AverageMeter()
+        self.meters['valid_nll_loss'] = AverageMeter()
+        self.meters['wps'] = TimeMeter()       # words per second
+        self.meters['ups'] = TimeMeter()       # updates per second
+        self.meters['wpb'] = AverageMeter()    # words per batch
+        self.meters['bsz'] = AverageMeter()    # sentences per batch
+        self.meters['gnorm'] = AverageMeter()  # gradient norm
+        self.meters['clip'] = AverageMeter()   # % of updates clipped
+        self.meters['oom'] = AverageMeter()    # out of memory
+        if args.fp16:
+            self.meters['loss_scale'] = AverageMeter()  # dynamic loss scale
+        self.meters['wall'] = TimeMeter()      # wall time in seconds
+        self.meters['train_wall'] = StopwatchMeter()  # train wall time in seconds
 
     @property
     def model(self):
@@ -370,21 +369,30 @@ class Trainer(object):
                 self._check_grad_norms(grad_norm)
 
             # take an optimization step
-            self.optimizer.step()
+
+            # xla takes care of optimization step using
+            #   torch_xla.xla_model.optimizer_step
+            # so skip optimization step here in that case
+            if not self.xla:
+                self.optimizer.step()
             self.set_num_updates(self.get_num_updates() + 1)
 
             # task specific update per step
             self.task.update_step(self._num_updates)
 
-            # log stats
-            logging_output = self._reduce_and_log_stats(logging_outputs, sample_size)
-            metrics.log_speed("ups", 1., priority=100, round=2)
-            metrics.log_scalar("gnorm", utils.item(grad_norm), priority=400, round=3)
-            metrics.log_scalar(
-                "clip",
-                100 if grad_norm > self.args.clip_norm > 0 else 0,
-                priority=500,
-                round=1,
+            # update meters
+            ntokens = logging_output.get('ntokens', 0)
+            nsentences = logging_output.get('nsentences', 0)
+            self.meters['wps'].update(ntokens)
+            self.meters['ups'].update(1.)
+            self.meters['wpb'].update(ntokens)
+            self.meters['bsz'].update(nsentences)
+            self.meters['gnorm'].update(grad_norm)
+            # the comparison below introduces too many .item() calls and slows
+            # down tpu
+            self.meters['clip'].update(
+                0.
+                #1. if grad_norm > self.args.clip_norm and self.args.clip_norm > 0 else 0.
             )
 
             # clear CUDA cache to reduce memory fragmentation
@@ -547,6 +555,14 @@ class Trainer(object):
         elif name in train_meters:
             return train_meters[name]
         return None
+
+    def meters_to_device(self, device):
+        """Send meters' values to given device. Useful for TPU's."""
+        for meter in self.meters.values():
+            for key, val in vars(meter).items():
+                if isinstance(val, torch.Tensor):
+                    newval = val.to(device=torch.device(device))
+                    setattr(meter, key, newval)
 
     def get_num_updates(self):
         """Get the number of parameters updates."""

@@ -11,15 +11,15 @@ from . import data_utils, FairseqDataset
 
 def collate(
     samples, pad_idx, eos_idx, left_pad_source=True, left_pad_target=False,
-    input_feeding=True,
+    input_feeding=True, input_shapes=None,
 ):
     if len(samples) == 0:
         return {}
 
     def merge(key, left_pad, move_eos_to_beginning=False):
         return data_utils.collate_tokens(
-            [s[key] for s in samples],
-            pad_idx, eos_idx, left_pad, move_eos_to_beginning,
+            [s[key] for s in samples], pad_idx,
+            eos_idx,left_pad, move_eos_to_beginning, input_shapes,
         )
 
     def check_alignment(alignment, src_len, tgt_len):
@@ -151,10 +151,8 @@ class LanguagePairDataset(FairseqDataset):
         tgt=None, tgt_sizes=None, tgt_dict=None,
         left_pad_source=True, left_pad_target=False,
         max_source_positions=1024, max_target_positions=1024,
-        shuffle=True, input_feeding=True,
-        remove_eos_from_source=False, append_eos_to_target=False,
-        align_dataset=None,
-        append_bos=False
+        shuffle=True, input_feeding=True, remove_eos_from_source=False, append_eos_to_target=False,
+        input_shapes=None,
     ):
         if tgt_dict is not None:
             assert src_dict.pad() == tgt_dict.pad()
@@ -174,10 +172,7 @@ class LanguagePairDataset(FairseqDataset):
         self.input_feeding = input_feeding
         self.remove_eos_from_source = remove_eos_from_source
         self.append_eos_to_target = append_eos_to_target
-        self.align_dataset = align_dataset
-        if self.align_dataset is not None:
-            assert self.tgt_sizes is not None, "Both source and target needed when alignments are provided"
-        self.append_bos = append_bos
+        self.input_shapes = input_shapes
 
     def __getitem__(self, index):
         tgt_item = self.tgt[index] if self.tgt is not None else None
@@ -249,7 +244,7 @@ class LanguagePairDataset(FairseqDataset):
         return collate(
             samples, pad_idx=self.src_dict.pad(), eos_idx=self.src_dict.eos(),
             left_pad_source=self.left_pad_source, left_pad_target=self.left_pad_target,
-            input_feeding=self.input_feeding,
+            input_feeding=self.input_feeding, input_shapes=self.input_shapes,
         )
 
     def num_tokens(self, index):
